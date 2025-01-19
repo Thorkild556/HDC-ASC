@@ -8,6 +8,7 @@ import torch
 from collections import OrderedDict
 
 
+
 def make_rand_vector(size=10000, seed=None): # np is faster
     rng = np.random.default_rng(seed)
     return (rng.integers(0, 2, size=size, dtype=np.int8) * 2 - 1)
@@ -320,6 +321,37 @@ def n_gram_encode_tensor_torch(tensor, n, single_window = False, weighted = Fals
     return result
     # return sum_matrix
 
+import torch
+
+def n_gram_encode_first_n(tensor, n, use_permutation=True):
+    # 1) Clone and keep only the first n windows
+    #    shape becomes (signal, n, vectorvalues)
+    t = tensor.clone()[:, :n, :]
+    
+    # 2) Create a list of (optionally permuted) slices
+    slices = []
+    for i in range(n):
+        # Each slice has shape (signal, vectorvalues)
+        slice_i = t[:, i, :]
+        
+        if use_permutation:
+            # "Positional" permutation in hyperdimensional computing
+            # by rolling along the vector dimension
+            # dims=1 is correct here because slice_i has shape (signal, vectorvalues).
+            slice_i = torch.roll(slice_i, shifts=i, dims=1)
+        
+        slices.append(slice_i)
+    
+    # 3) Multiply (bind) all slices together to get one final hypervector per signal
+    #    Start with the first slice
+    out = slices[0]
+    for i in range(1, n):
+        out = out * slices[i]  # elementwise multiply
+
+    # 4) Return shape (signal, vectorvalues)
+    return out
+
+
 
 # def normalise_mfccs(mfccs, separate_signals = False):
 #     copy_mfccs = mfccs.clone()
@@ -535,7 +567,9 @@ def encode_mfccs_batched(mfccs, vector1, vector2, batch_size, rand_mfcc_matrix, 
             # break
 
         finished = n_gram_encode_tensor_torch(bound_batch, n= n_gram, single_window = single_window)
-        finished = finished
+        #
+        # finished = n_gram_encode_first_n(bound_batch, n= n_gram, use_permutation=True)
+
         output_tensors.append(finished)
 
     output_tensor = torch.cat(output_tensors, dim=0) # Shape: (signals, vector)
@@ -620,6 +654,44 @@ def predict(model, mfccs, majority_vote = False, weighing = False):
     predictions = unique_labels[argmax]
 
     return predictions
+
+
+def fine_tune_model(model, labels, encoded_mfccs, learning_rate = 0.2, iterations = 1, majority_vote = False):
+
+    mod, unique_labels, rand_mfcc_matrix, vector1, vector2, batch_size, separate_signals, seed, n_gram, alpha, group_size = model
+
+    seed += 1
+
+    #encoded_mfccs = encode_mfccs_batched(mfccs, vector1, vector2, batch_size, rand_mfcc_matrix, separate_signals=separate_signals, seed = seed, n_gram = n_gram, alpha=alpha, group_size=group_size, weighing = weighing)
+    
+    if majority_vote == True:
+        encoded_mfccs = majority_vote_torch(encoded_mfccs)
+
+    for i in range(iterations):
+        cos_sim_matrix = cosine_similarity_matrix_torch(mod, encoded_mfccs)
+
+        #i have no freakin' clue why this is neccesary but the gpu returns the wrong argmax for some reason
+        cos_sim_matrix = cos_sim_matrix.to("cpu") 
+
+        argmax = torch.argmax(cos_sim_matrix, dim = 0)
+
+        predictions = unique_labels[argmax]
+
+        wrong_idx = torch.nonzero(predictions != labels)
+
+        mis_preds = predictions[wrong_idx]      # rows to update
+        mis_true  = labels[wrong_idx] 
+        mis_vecs  = encoded_mfccs[wrong_idx]    # vectors to subtract
+
+        # Subtract in a single, vectorized operation:
+        mod.index_put_((mis_preds,), -mis_vecs*learning_rate, accumulate=True)
+
+        #Add to the true class row
+        mod.index_put_((mis_true,), mis_vecs * learning_rate, accumulate=True)
+
+        
+
+    return mod, unique_labels, rand_mfcc_matrix, vector1, vector2, batch_size, separate_signals, seed, n_gram, alpha, group_size
 
 
 
